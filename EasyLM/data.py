@@ -47,6 +47,40 @@ class DatasetFactory(object):
         raise ValueError('DatasetFactory is a static class and should not be instantiated.')
 
 
+class ContrastiveDatasetFactory(object):
+    """ Datset builder class. """
+
+    @staticmethod
+    def get_default_config(updates=None):
+        config = ConfigDict()
+        config.type = 'huggingface'
+        config.positive_text_processor = TextProcessor.get_default_config()
+        config.negative_text_processor = TextProcessor.get_default_config()
+        config.huggingface_dataset = HuggingfaceDataset.get_default_config()
+        config.json_dataset = JsonDataset.get_default_config()
+
+        if updates is not None:
+            config.update(ConfigDict(updates).copy_and_resolve_references())
+        return config
+
+    @classmethod
+    def load_dataset(cls, config, tokenizer, **kwargs):
+        config = cls.get_default_config(config)
+        positive_text_processor = TextProcessor(config.positive_text_processor, tokenizer)
+        negative_text_processor = TextProcessor(config.negative_text_processor, tokenizer)
+        if config.type == 'huggingface':
+            return ContrastiveHuggingfaceDataset(
+                config.huggingface_dataset, tokenizer, positive_text_processor, negative_text_processor, **kwargs
+            )
+        elif config.type == 'json':
+            return NotImplementedError()
+        else:
+            raise ValueError(f'Unknown dataset type: {config.type}')
+
+    def __init__(self):
+        raise ValueError('DatasetFactory is a static class and should not be instantiated.')
+
+
 class TextProcessor(object):
     """ Example processor that converts a dictionary of texts into tokens. """
 
@@ -181,6 +215,98 @@ class HuggingfaceDataset(object):
                     yield batch, metrics
                     token_buffer = token_buffer[chunk_size:]
                     loss_mask_buffer = loss_mask_buffer[chunk_size:]
+
+    def __getstate__(self):
+        return self.config, self.tokenizer
+
+    def __setstate__(self, state):
+        config, tokenizer = state
+        self.__init__(config, tokenizer)
+
+    @property
+    def seq_length(self):
+        return self.config.seq_length
+
+    @property
+    def tokenizer(self):
+        return self._tokenizer
+
+    @property
+    def text_processor(self):
+        return self._text_processor
+
+    @property
+    def dataset(self):
+        return self._dataset
+
+    @property
+    def vocab_size(self):
+        return len(self._tokenizer)
+    
+class ContrastiveHuggingfaceDataset(object):
+    """ Huggingface dataset, where each row contain prompt, accepted response (positive), 
+    and rejected response (negative).
+    """
+
+
+    @staticmethod
+    def get_default_config(updates=None):
+        config = ConfigDict()
+        config.path = 'Dahoas/full-hh-rlhf'
+        config.name = 'en'
+        config.split = 'train'
+        config.streaming = False
+        config.seq_length = 1024
+        config.batch_size = 8
+        config.always_start_with_bos = False
+
+        if updates is not None:
+            config.update(ConfigDict(updates).copy_and_resolve_references())
+        return config
+
+    def __init__(self, config, tokenizer, positive_text_processor, negative_text_processor):
+        self.config = self.get_default_config(config)
+        name = self.config.name if self.config.name != '' else None
+        split = self.config.split if self.config.split != '' else None
+        self._tokenizer = tokenizer
+        self._positive_text_processor = positive_text_processor
+        self._negative_text_processor = negative_text_processor
+        self._dataset = load_dataset(
+            self.config.path, name, split=split, streaming=self.config.streaming
+        )
+
+    def __iter__(self):
+        total_tokens = 0
+        while True:
+            for index, example in enumerate(self._dataset):
+                positive_tokens, positive_loss_masks = self._positive_text_processor(example)
+                positive_tokens_padded, positive_loss_masks_padded, positive_attention_mask = _pad(
+                    positive_tokens, positive_loss_masks, self.config.seq_length, self.tokenizer.pad_token_id
+                )
+                total_tokens += len(positive_tokens)
+                
+                negative_tokens, negative_loss_masks = self._negative_text_processor(example)
+                negative_tokens_padded, negative_loss_masks_padded, negative_attention_mask = _pad(
+                    negative_tokens, negative_loss_masks, self.config.seq_length, self.tokenizer.pad_token_id
+                )
+                
+                if self.config.always_start_with_bos:
+                    raise NotImplementedError()
+
+                batch = {
+                    'positive_tokens': positive_tokens_padded,
+                    'positive_attention_mask': positive_attention_mask,
+                    'positive_loss_masks': positive_loss_masks_padded,
+                    'negative_tokens': negative_tokens_padded,
+                    'negative_attention_mask': negative_attention_mask,
+                    'negative_loss_masks': negative_loss_masks_padded,
+                }
+                metrics = {
+                        'dataset_example_index': index,
+                        'dataset_total_tokens': total_tokens,
+                }
+
+                yield batch, metrics
 
     def __getstate__(self):
         return self.config, self.tokenizer
@@ -365,3 +491,16 @@ class JsonDataset(object):
     @property
     def vocab_size(self):
         return len(self.tokenizer)
+
+
+def _pad(tokens, loss_masks, seq_length, pad_token_id):
+        padded_shape = (1, seq_length)
+        num_tokens_kept = min(len(tokens), seq_length)
+        tokens_padded = np.full(padded_shape, pad_token_id, dtype=np.int32)
+        tokens_padded[0, :num_tokens_kept] = tokens[:num_tokens_kept]
+        loss_masks_padded = np.zeros(padded_shape, dtype=np.float32)
+        loss_masks_padded[0, :num_tokens_kept] = loss_masks[:num_tokens_kept]
+        attention_mask = np.zeros(padded_shape, dtype=np.int32)
+        attention_mask[0, :num_tokens_kept] = 1
+
+        return tokens_padded, loss_masks_padded, attention_mask
