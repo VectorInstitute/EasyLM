@@ -242,6 +242,21 @@ def cross_entropy_loss_and_accuracy(logits, tokens, valid=None):
     accuracy = jnp.mean(jnp.sum(correct, axis=-1) / valid_text_length)
     return loss, accuracy
 
+def rrhf_loss(pos_logits, pos_tokens, pos_valid, neg_logits, neg_tokens, neg_valid):
+    pos_loss, _ = cross_entropy_loss_and_accuracy(pos_logits, pos_tokens, pos_valid)
+    neg_loss, _ = cross_entropy_loss_and_accuracy(neg_logits, neg_tokens, neg_valid)
+    
+    ranking_loss = jnp.maximum(pos_loss - neg_loss, jnp.array(0.0))
+    ranking_correct = jnp.where(
+        pos_loss < neg_loss,
+        jnp.array(True),
+        jnp.array(False)
+    )
+    ranking_accuracy = jnp.mean(ranking_correct)
+
+    total_loss = ranking_loss + pos_loss
+    return total_loss, ranking_accuracy
+
 
 def global_norm(tree):
     """ Return the global L2 norm of a pytree. """

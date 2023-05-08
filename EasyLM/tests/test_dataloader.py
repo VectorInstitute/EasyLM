@@ -2,7 +2,12 @@ import unittest
 import jax
 
 from EasyLM.models.llama.llama_model import LLaMAConfig
-from EasyLM.data import DatasetFactory, HuggingfaceDataset, TextProcessor, ContrastiveDatasetFactory
+from EasyLM.data import (
+    DatasetFactory,
+    HuggingfaceDataset,
+    TextProcessor,
+    ContrastiveDatasetFactory,
+)
 
 
 def _print_tree_shape(tree):
@@ -40,6 +45,7 @@ class DataloaderTests(unittest.TestCase):
     def test_dataset_iterator(self):
         batch, metrics = next(iter(DataloaderTests.dataset))
         _print_tree_shape(batch)
+
 
 class ContrastiveDataloaderTests(unittest.TestCase):
     @classmethod

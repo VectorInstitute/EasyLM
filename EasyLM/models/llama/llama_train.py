@@ -24,7 +24,8 @@ from EasyLM.jax_utils import (
     JaxRNG, next_rng, match_partition_rules,
     cross_entropy_loss_and_accuracy, named_tree_map, global_norm,
     set_random_seed, average_metrics, get_weight_decay_mask,
-    make_shard_and_gather_fns, with_sharding_constraint
+    make_shard_and_gather_fns, with_sharding_constraint,
+    rrhf_loss
 )
 from EasyLM.models.llama.llama_model import (
     LLaMAConfig, FlaxLLaMAForCausalLM, FlaxLLaMAForCausalLMModule
@@ -52,6 +53,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     llama=LLaMAConfig.get_default_config(),
     logger=mlxu.WandBLogger.get_default_config(),
     log_all_worker=False,
+    objective='mlm',  # 'mlm' or 'rrhf'
 )
 
 
@@ -119,13 +121,35 @@ def main(argv):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         def loss_and_accuracy(params):
-            logits = model.apply(
-                params, batch['input_tokens'], deterministic=False,
-                rngs=rng_generator(llama_config.rng_keys()),
-            ).logits
-            return cross_entropy_loss_and_accuracy(
-                logits, batch['target_tokens'], batch['loss_masks']
-            )
+            if FLAGS.objective == "mlm":
+                logits = model.apply(
+                    params, batch['input_tokens'], deterministic=False,
+                    rngs=rng_generator(llama_config.rng_keys()),
+                ).logits
+                return cross_entropy_loss_and_accuracy(
+                    logits, batch['target_tokens'], batch['loss_masks']
+                )
+            elif FLAGS.objective == "rrhf":
+                pos_logits = model.apply(
+                    params, 
+                    batch["positive_tokens"][:, :-1], 
+                    attention_mask=batch["positive_attention_mask"],
+                )
+                neg_logits = model.apply(
+                    params, 
+                    batch["negative_tokens"][:, :-1], 
+                    attention_mask=batch["negative_attention_mask"],
+                )
+                return rrhf_loss(
+                    pos_logits, 
+                    batch["positive_tokens"][:, 1:], 
+                    batch["positive_loss_masks"][:, 1:], 
+                    neg_logits, 
+                    batch["negative_tokens"][:, 1:], 
+                    batch["negative_loss_masks"][:, 1:],
+                )
+
+
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
         (loss, accuracy), grads = grad_fn(train_state.params)
         train_state = train_state.apply_gradients(grads=grads)
