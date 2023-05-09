@@ -23,6 +23,8 @@ class DatasetFactory(object):
         config = ConfigDict()
         config.type = 'huggingface'
         config.text_processor = TextProcessor.get_default_config()
+        config.positive_text_processor = TextProcessor.get_default_config()
+        config.negative_text_processor = TextProcessor.get_default_config()
         config.huggingface_dataset = HuggingfaceDataset.get_default_config()
         config.json_dataset = JsonDataset.get_default_config()
 

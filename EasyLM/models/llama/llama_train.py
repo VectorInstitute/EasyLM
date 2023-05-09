@@ -17,7 +17,7 @@ from flax.jax_utils import prefetch_to_device
 from flax.training.train_state import TrainState
 import optax
 
-from EasyLM.data import DatasetFactory
+from EasyLM.data import DatasetFactory, ContrastiveDatasetFactory
 from EasyLM.checkpoint import StreamingCheckpointer
 from EasyLM.optimizers import OptimizerFactory
 from EasyLM.jax_utils import (
@@ -53,7 +53,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     llama=LLaMAConfig.get_default_config(),
     logger=mlxu.WandBLogger.get_default_config(),
     log_all_worker=False,
-    objective='mlm',  # 'mlm' or 'rrhf'
+    objective='clm',  # 'clm' or 'rrhf'
 )
 
 
@@ -71,14 +71,28 @@ def main(argv):
     set_random_seed(FLAGS.seed)
 
     tokenizer = LLaMAConfig.get_tokenizer(FLAGS.tokenizer)
-    dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
+    if FLAGS.objective == 'clm':
+        dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
+    elif FLAGS.objective == 'rrhf':
+        dataset = ContrastiveDatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
+    else:
+        raise NotImplementedError()
+    
     if FLAGS.load_dataset_state != '':
         dataset.load_state_dict(mlxu.load_pickle(FLAGS.load_dataset_state))
 
     if FLAGS.eval_steps > 0:
-        eval_dataset = DatasetFactory.load_dataset(
-            FLAGS.eval_dataset, dataset.tokenizer
-        )
+        if FLAGS.objective == 'clm':
+            eval_dataset = DatasetFactory.load_dataset(
+                FLAGS.eval_dataset, dataset.tokenizer
+            )
+        elif FLAGS.objective == 'rrhf':
+            eval_dataset = ContrastiveDatasetFactory.load_dataset(
+                FLAGS.eval_dataset, dataset.tokenizer
+            )
+        else:
+            raise NotImplementedError()
+        
         eval_iterator = iter(eval_dataset)
 
     seq_length = dataset.seq_length
@@ -121,7 +135,7 @@ def main(argv):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
         def loss_and_accuracy(params):
-            if FLAGS.objective == "mlm":
+            if FLAGS.objective == 'clm':
                 logits = model.apply(
                     params, batch['input_tokens'], deterministic=False,
                     rngs=rng_generator(llama_config.rng_keys()),
@@ -129,17 +143,21 @@ def main(argv):
                 return cross_entropy_loss_and_accuracy(
                     logits, batch['target_tokens'], batch['loss_masks']
                 )
-            elif FLAGS.objective == "rrhf":
+            elif FLAGS.objective == 'rrhf':
                 pos_logits = model.apply(
                     params, 
                     batch["positive_tokens"][:, :-1], 
-                    attention_mask=batch["positive_attention_mask"],
-                )
+                    attention_mask=batch["positive_attention_mask"][:, :-1],
+                    deterministic=False,
+                    rngs=rng_generator(llama_config.rng_keys()),
+                ).logits
                 neg_logits = model.apply(
                     params, 
                     batch["negative_tokens"][:, :-1], 
-                    attention_mask=batch["negative_attention_mask"],
-                )
+                    attention_mask=batch["negative_attention_mask"][:, :-1], 
+                    deterministic=False,
+                    rngs=rng_generator(llama_config.rng_keys()),
+                ).logits
                 return rrhf_loss(
                     pos_logits, 
                     batch["positive_tokens"][:, 1:], 
@@ -165,18 +183,48 @@ def main(argv):
     def eval_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-        logits = model.apply(
-            train_state.params, batch['input_tokens'], deterministic=True,
-            rngs=rng_generator(llama_config.rng_keys()),
-        ).logits
-        loss, accuracy = cross_entropy_loss_and_accuracy(
-            logits, batch['target_tokens'], batch['loss_masks']
-        )
-        metrics = dict(
-            eval_loss=loss,
-            eval_accuracy=accuracy,
-        )
-        return rng_generator(), metrics
+        
+        if FLAGS.objective == 'clm':
+            logits = model.apply(
+                train_state.params, batch['input_tokens'], deterministic=True,
+                rngs=rng_generator(llama_config.rng_keys()),
+            ).logits
+            loss, accuracy = cross_entropy_loss_and_accuracy(
+                logits, batch['target_tokens'], batch['loss_masks']
+            )
+            metrics = dict(
+                eval_loss=loss,
+                eval_accuracy=accuracy,
+            )
+            return rng_generator(), metrics
+        elif FLAGS.objective == 'rrhf':
+            pos_logits = model.apply(
+                train_state.params, 
+                batch["positive_tokens"][:, :-1], 
+                attention_mask=batch["positive_attention_mask"][:, :-1], 
+                deterministic=True,
+                rngs=rng_generator(llama_config.rng_keys()),
+            ).logits
+            neg_logits = model.apply(
+                train_state.params, 
+                batch["negative_tokens"][:, :-1],
+                attention_mask=batch["negative_attention_mask"][:, :-1], 
+                deterministic=True,
+                rngs=rng_generator(llama_config.rng_keys()),
+            ).logits
+            loss, accuracy = rrhf_loss(
+                pos_logits, 
+                batch["positive_tokens"][:, 1:], 
+                batch["positive_loss_masks"][:, 1:], 
+                neg_logits, 
+                batch["negative_tokens"][:, 1:], 
+                batch["negative_loss_masks"][:, 1:],
+            )
+            metrics = dict(
+                eval_loss=loss,
+                eval_accuracy=accuracy,
+            )
+            return rng_generator(), metrics
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
@@ -230,7 +278,7 @@ def main(argv):
             train_state=train_state,
             gather_fns=gather_fns,
             metadata=metadata,
-            dataset=dataset.get_state_dict(),
+            # dataset=dataset.get_state_dict(),
             milestone=milestone,
         )
 
@@ -292,4 +340,5 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    mlxu.run(main)
+    with jax.spmd_mode('allow_all'):
+        mlxu.run(main)
