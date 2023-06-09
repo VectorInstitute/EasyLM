@@ -137,6 +137,13 @@ class TextProcessor(object):
             elif field == '<|eos|>':
                 token_buffer.append(self.tokenizer.eos_token_id)
                 loss_mask_buffer.append(mask)
+            elif field.startswith('{') and field.endswith('}'):
+                text = field[1:-1]
+                if i == 0:
+                    text = self.config.prepend_text + text
+                tokens = self.tokenizer.encode(text)
+                token_buffer.extend(tokens)
+                loss_mask_buffer.extend([mask for _ in range(len(tokens))])
             else:
                 subfields = field.split('+')
                 text = self.config.subfield_separator.join(
