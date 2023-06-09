@@ -257,6 +257,30 @@ def rrhf_loss(pos_logits, pos_tokens, pos_valid, neg_logits, neg_tokens, neg_val
     total_loss = ranking_loss + pos_loss
     return total_loss, ranking_accuracy
 
+def dpo_loss(yw_logits, yw_logits_ref, yw_tokens, yw_valid, yl_logits, yl_logits_ref, yl_tokens, yl_valid, kl_scale):
+    """
+    Rewrite fractions in the original DPO formulation 
+    (equation 7 in v1 of the paper) using the property of logarithm:
+    log(a/b) = log(a) - log(b)
+
+    yw: continuations in each pair that are preferred more.
+    yl: continuations in each pair that are preferred less.
+    """
+    policy_yw_log_prob, policy_yw_acc = cross_entropy_loss_and_accuracy(yw_logits, yw_tokens, yw_valid)
+    policy_yl_log_prob, policy_yl_acc = cross_entropy_loss_and_accuracy(yl_logits, yl_tokens, yl_valid)
+
+    ref_yw_log_prob, ref_yw_acc = cross_entropy_loss_and_accuracy(yw_logits_ref, yw_tokens, yw_valid)
+    ref_yl_log_prob, ref_yl_acc = cross_entropy_loss_and_accuracy(yl_logits_ref, yl_tokens, yl_valid)
+
+    policy_log_ratios = policy_yw_log_prob - policy_yl_log_prob
+    ref_log_ratios = ref_yw_log_prob - ref_yl_log_prob
+
+    losses = -jax.nn.log_sigmoid(kl_scale * (policy_log_ratios - ref_log_ratios))
+    rewards = kl_scale * (policy_log_ratios - ref_log_ratios)
+    reward_modelling_accuracy = jnp.mean(policy_yw_log_prob > ref_yl_log_prob)
+
+    return losses, reward_modelling_accuracy, rewards
+    
 
 def global_norm(tree):
     """ Return the global L2 norm of a pytree. """

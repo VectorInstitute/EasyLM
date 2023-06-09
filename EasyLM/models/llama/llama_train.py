@@ -2,6 +2,7 @@ import dataclasses
 import pprint
 from functools import partial
 import re
+from typing import Any, Optional
 
 from tqdm import tqdm, trange
 import numpy as np
@@ -25,11 +26,15 @@ from EasyLM.jax_utils import (
     cross_entropy_loss_and_accuracy, named_tree_map, global_norm,
     set_random_seed, average_metrics, get_weight_decay_mask,
     make_shard_and_gather_fns, with_sharding_constraint,
-    rrhf_loss
+    rrhf_loss, dpo_loss
 )
 from EasyLM.models.llama.llama_model import (
     LLaMAConfig, FlaxLLaMAForCausalLM, FlaxLLaMAForCausalLMModule
 )
+
+
+class DPOTrainState(TrainState):
+    ref_params: Optional[flax.core.FrozenDict[str, Any]] = None
 
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
@@ -40,6 +45,7 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     load_llama_config='',
     update_llama_config='',
     load_checkpoint='',
+    load_checkpoint_ref='',
     load_dataset_state='',
     log_freq=50,
     save_model_freq=0,
@@ -53,7 +59,8 @@ FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
     llama=LLaMAConfig.get_default_config(),
     logger=mlxu.WandBLogger.get_default_config(),
     log_all_worker=False,
-    objective='clm',  # 'clm' or 'rrhf'
+    objective='clm',  # 'clm' or 'rrhf' or 'dpo'
+    dpo_kl_scale=0.1,
 )
 
 
@@ -86,7 +93,7 @@ def main(argv):
             eval_dataset = DatasetFactory.load_dataset(
                 FLAGS.eval_dataset, dataset.tokenizer
             )
-        elif FLAGS.objective == 'rrhf':
+        elif FLAGS.objective in ['rrhf', 'dpo']:
             eval_dataset = ContrastiveDatasetFactory.load_dataset(
                 FLAGS.eval_dataset, dataset.tokenizer
             )
@@ -118,8 +125,10 @@ def main(argv):
         get_weight_decay_mask(LLaMAConfig.get_weight_decay_exclusions())
     )
 
-    def create_trainstate_from_params(params):
-        return TrainState.create(params=params, tx=optimizer, apply_fn=None)
+    def create_trainstate_from_params(params, ref_params=None):
+        return DPOTrainState.create(
+            params=params, ref_params=ref_params, tx=optimizer, apply_fn=None
+        )
 
     def init_fn(rng):
         rng_generator = JaxRNG(rng)
@@ -129,12 +138,20 @@ def main(argv):
             attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
             rngs=rng_generator(llama_config.rng_keys()),
         )
-        return TrainState.create(params=params, tx=optimizer, apply_fn=None)
+        ref_params = model.init(
+            input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
+            position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
+            attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
+            rngs=rng_generator(llama_config.rng_keys()),
+        )
+        return DPOTrainState.create(
+            params=params, ref_params=ref_params, tx=optimizer, apply_fn=None
+        )
 
     def train_step(train_state, rng, batch):
         rng_generator = JaxRNG(rng)
         batch = with_sharding_constraint(batch, PS(('dp', 'fsdp')))
-        def loss_and_accuracy(params):
+        def loss_and_accuracy(params, params_ref=None):
             if FLAGS.objective == 'clm':
                 logits = model.apply(
                     params, batch['input_tokens'], deterministic=False,
@@ -166,10 +183,66 @@ def main(argv):
                     batch["negative_tokens"][:, 1:], 
                     batch["negative_loss_masks"][:, 1:],
                 )
+            elif FLAGS.objective == "dpo":
+                assert params_ref is not None
 
+                yw_logits = model.apply(
+                    params, 
+                    batch["positive_tokens"][:, :-1], 
+                    attention_mask=batch["positive_attention_mask"][:, :-1],
+                    deterministic=False,
+                    rngs=rng_generator(llama_config.rng_keys()),
+                ).logits
+                yw_logits_ref = model.apply(
+                    params_ref, 
+                    batch["positive_tokens"][:, :-1], 
+                    attention_mask=batch["positive_attention_mask"][:, :-1],
+                    deterministic=False,
+                    rngs=rng_generator(llama_config.rng_keys()),
+                ).logits
+                yl_logits = model.apply(
+                    params, 
+                    batch["negative_tokens"][:, :-1], 
+                    attention_mask=batch["negative_attention_mask"][:, :-1], 
+                    deterministic=False,
+                    rngs=rng_generator(llama_config.rng_keys()),
+                ).logits
+                yl_logits_ref = model.apply(
+                    params_ref, 
+                    batch["positive_tokens"][:, :-1], 
+                    attention_mask=batch["positive_attention_mask"][:, :-1],
+                    deterministic=False,
+                    rngs=rng_generator(llama_config.rng_keys()),
+                ).logits
+
+                return dpo_loss(
+                    yw_logits, 
+                    yw_logits_ref,                     
+                    batch["positive_tokens"][:, 1:], 
+                    batch["positive_loss_masks"][:, 1:], 
+                    yl_logits,
+                    yl_logits_ref,
+                    batch["negative_tokens"][:, 1:], 
+                    batch["negative_loss_masks"][:, 1:],
+                    jnp.array(FLAGS.dpo_kl_scale),
+                )
 
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
-        (loss, accuracy), grads = grad_fn(train_state.params)
+        
+        if FLAGS.objective == "dpo":
+            (loss, rm_accuracy, reward), grads = grad_fn(train_state.params, train_state.params_ref)
+            train_state = train_state.apply_gradients(grads=grads)
+            metrics = dict(
+                loss=loss,
+                rm_accuracy=rm_accuracy,
+                reward=reward,
+                learning_rate=optimizer_info['learning_rate_schedule'](train_state.step),
+                gradient_norm=global_norm(grads),
+                param_norm=global_norm(train_state.params),
+            )
+            return train_state, rng_generator(), metrics
+
+        (loss, accuracy), grads = grad_fn(train_state.params, train_state.params_ref)
         train_state = train_state.apply_gradients(grads=grads)
         metrics = dict(
             loss=loss,
@@ -225,6 +298,52 @@ def main(argv):
                 eval_accuracy=accuracy,
             )
             return rng_generator(), metrics
+        elif FLAGS.objective == 'dpo':
+            yw_logits = model.apply(
+                train_state.params, 
+                batch["positive_tokens"][:, :-1], 
+                attention_mask=batch["positive_attention_mask"][:, :-1], 
+                deterministic=True,
+                rngs=rng_generator(llama_config.rng_keys()),
+            ).logits
+            yw_logits_ref = model.apply(
+                train_state.params_ref, 
+                batch["positive_tokens"][:, :-1], 
+                attention_mask=batch["positive_attention_mask"][:, :-1], 
+                deterministic=True,
+                rngs=rng_generator(llama_config.rng_keys()),
+            ).logits
+            yl_logits = model.apply(
+                train_state.params, 
+                batch["negative_tokens"][:, :-1],
+                attention_mask=batch["negative_attention_mask"][:, :-1], 
+                deterministic=True,
+                rngs=rng_generator(llama_config.rng_keys()),
+            ).logits
+            yl_logits_ref = model.apply(
+                train_state.params_ref, 
+                batch["negative_tokens"][:, :-1],
+                attention_mask=batch["negative_attention_mask"][:, :-1], 
+                deterministic=True,
+                rngs=rng_generator(llama_config.rng_keys()),
+            ).logits
+            loss, rm_accuracy, reward = dpo_loss(
+                    yw_logits, 
+                    yw_logits_ref,                     
+                    batch["positive_tokens"][:, 1:], 
+                    batch["positive_loss_masks"][:, 1:], 
+                    yl_logits,
+                    yl_logits_ref,
+                    batch["negative_tokens"][:, 1:], 
+                    batch["negative_loss_masks"][:, 1:],
+                    jnp.array(FLAGS.dpo_kl_scale),
+                )
+            metrics = dict(
+                eval_loss=loss,
+                eval_rm_accuracy=rm_accuracy,
+                eval_reward=reward,
+            )
+            return rng_generator(), metrics
 
     train_state_shapes = jax.eval_shape(init_fn, next_rng())
     train_state_partition = match_partition_rules(
@@ -247,7 +366,7 @@ def main(argv):
 
     sharded_create_trainstate_from_params = pjit(
         create_trainstate_from_params,
-        in_shardings=(train_state_partition.params, ),
+        in_shardings=(train_state_partition.params, train_state_partition.params_ref),
         out_shardings=train_state_partition,
         donate_argnums=(0, ),
     )
@@ -290,13 +409,23 @@ def main(argv):
                 FLAGS.load_checkpoint, train_state_shapes, shard_fns
             )
 
+        # Load reference weights if objective is DPO.
+        if FLAGS.objective == "dpo":
+            train_state, restored_params_ref = checkpointer.load_trainstate_checkpoint(
+                FLAGS.load_checkpoint_ref, train_state_shapes, shard_fns
+            )
+        else:
+            restored_params_ref = None
+
         if train_state is None and restored_params is None:
             # Initialize from scratch
             train_state = sharded_init_fn(next_rng())
         elif train_state is None and restored_params is not None:
             # Restore from params but initialize train_state
-            train_state = sharded_create_trainstate_from_params(restored_params)
+            train_state = sharded_create_trainstate_from_params(restored_params, restored_params_ref)
             del restored_params
+            if restored_params_ref is not None:
+                del restored_params_ref
 
         start_step = int(jax.device_get(train_state.step))
 
