@@ -4,6 +4,7 @@ import time
 from functools import partial
 import json
 from multiprocessing import Pool
+import os
 
 import h5py
 import mlxu
@@ -12,7 +13,7 @@ from ml_collections import ConfigDict
 from tqdm import tqdm, trange
 import numpy as np
 
-from datasets import load_dataset
+from datasets import load_dataset, load_from_disk
 
 
 class DatasetFactory(object):
@@ -188,9 +189,12 @@ class HuggingfaceDataset(object):
         split = self.config.split if self.config.split != '' else None
         self._tokenizer = tokenizer
         self._text_processor = text_processor
-        self._dataset = load_dataset(
-            self.config.path, name, split=split, streaming=self.config.streaming
-        )
+        if os.path.exists(self.config.path):
+            self._dataset = load_from_disk(self.config.path)[split]
+        else:
+            self._dataset = load_dataset(
+                self.config.path, name, split=split, streaming=self.config.streaming
+            )
 
     def __iter__(self):
         chunk_size = self.config.batch_size * self.config.seq_length
@@ -280,9 +284,12 @@ class ContrastiveHuggingfaceDataset(object):
         self._tokenizer = tokenizer
         self._positive_text_processor = positive_text_processor
         self._negative_text_processor = negative_text_processor
-        self._dataset = load_dataset(
-            self.config.path, name, split=split, streaming=self.config.streaming
-        )
+        if os.path.exists(self.config.path):
+            self._dataset = load_from_disk(self.config.path)[split]
+        else:
+            self._dataset = load_dataset(
+                self.config.path, name, split=split, streaming=self.config.streaming
+            )
 
     def __iter__(self):
         total_tokens = 0
