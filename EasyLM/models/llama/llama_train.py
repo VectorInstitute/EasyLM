@@ -34,7 +34,7 @@ from EasyLM.models.llama.llama_model import (
 
 
 class DPOTrainState(TrainState):
-    ref_params: Optional[flax.core.FrozenDict[str, Any]] = None
+    params_ref: Optional[flax.core.FrozenDict[str, Any]] = None
 
 
 FLAGS, FLAGS_DEF = mlxu.define_flags_with_default(
@@ -80,7 +80,7 @@ def main(argv):
     tokenizer = LLaMAConfig.get_tokenizer(FLAGS.tokenizer)
     if FLAGS.objective == 'clm':
         dataset = DatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
-    elif FLAGS.objective == 'rrhf':
+    elif FLAGS.objective in ['dpo', 'rrhf']:
         dataset = ContrastiveDatasetFactory.load_dataset(FLAGS.train_dataset, tokenizer)
     else:
         raise NotImplementedError()
@@ -125,9 +125,9 @@ def main(argv):
         get_weight_decay_mask(LLaMAConfig.get_weight_decay_exclusions())
     )
 
-    def create_trainstate_from_params(params, ref_params=None):
+    def create_trainstate_from_params(params, params_ref=None):
         return DPOTrainState.create(
-            params=params, ref_params=ref_params, tx=optimizer, apply_fn=None
+            params=params, params_ref=params_ref, tx=optimizer, apply_fn=None
         )
 
     def init_fn(rng):
@@ -138,14 +138,14 @@ def main(argv):
             attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
             rngs=rng_generator(llama_config.rng_keys()),
         )
-        ref_params = model.init(
+        params_ref = model.init(
             input_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
             position_ids=jnp.zeros((4, seq_length), dtype=jnp.int32),
             attention_mask=jnp.ones((4, seq_length), dtype=jnp.int32),
             rngs=rng_generator(llama_config.rng_keys()),
         )
         return DPOTrainState.create(
-            params=params, ref_params=ref_params, tx=optimizer, apply_fn=None
+            params=params, params_ref=params_ref, tx=optimizer, apply_fn=None
         )
 
     def train_step(train_state, rng, batch):
@@ -230,7 +230,7 @@ def main(argv):
         grad_fn = jax.value_and_grad(loss_and_accuracy, has_aux=True)
         
         if FLAGS.objective == "dpo":
-            (loss, rm_accuracy, reward), grads = grad_fn(train_state.params, train_state.params_ref)
+            (loss, (rm_accuracy, reward)), grads = grad_fn(train_state.params, train_state.params_ref)
             train_state = train_state.apply_gradients(grads=grads)
             metrics = dict(
                 loss=loss,
@@ -327,7 +327,7 @@ def main(argv):
                 deterministic=True,
                 rngs=rng_generator(llama_config.rng_keys()),
             ).logits
-            loss, rm_accuracy, reward = dpo_loss(
+            loss, (rm_accuracy, reward) = dpo_loss(
                     yw_logits, 
                     yw_logits_ref,                     
                     batch["positive_tokens"][:, 1:], 

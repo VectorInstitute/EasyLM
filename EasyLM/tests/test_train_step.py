@@ -78,7 +78,7 @@ class RMLossTests(unittest.TestCase):
         logger.debug("positive_loss_masks: {}".format(batch["positive_loss_masks"][:, 1:]))
         logger.debug("positive_tokens: {}".format(jnp.ones_like(batch["positive_tokens"][:, 1:])))
 
-        example_loss, example_rm_accuracy, example_reward = dpo_loss(
+        example_loss, (example_rm_accuracy, example_reward) = dpo_loss(
             yw_logits,
             yw_logits_ref,
             jnp.ones_like(batch["positive_tokens"][:, 1:]),

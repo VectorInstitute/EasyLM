@@ -279,7 +279,7 @@ def dpo_loss(yw_logits, yw_logits_ref, yw_tokens, yw_valid, yl_logits, yl_logits
     rewards = kl_scale * (policy_log_ratios - ref_log_ratios)
     reward_modelling_accuracy = jnp.mean(policy_yw_log_prob > ref_yl_log_prob)
 
-    return losses, reward_modelling_accuracy, rewards
+    return losses, (reward_modelling_accuracy, rewards)
     
 
 def global_norm(tree):

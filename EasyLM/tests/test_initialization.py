@@ -46,9 +46,9 @@ class InitializationTests(unittest.TestCase):
             enable=jax.process_index() == 0,
         )
 
-        def create_trainstate_from_params(params, ref_params=None):
+        def create_trainstate_from_params(params, params_ref=None):
             return DPOTrainState.create(
-                params=params, ref_params=ref_params, tx=optimizer, apply_fn=None
+                params=params, params_ref=params_ref, tx=optimizer, apply_fn=None
             )
 
         def init_fn(rng):
@@ -59,14 +59,14 @@ class InitializationTests(unittest.TestCase):
                 attention_mask=jnp.ones((4, SEQ_LENGTH), dtype=jnp.int32),
                 rngs=rng_generator(llama_config.rng_keys()),
             )
-            ref_params = cls.model.init(
+            params_ref = cls.model.init(
                 input_ids=jnp.zeros((4, SEQ_LENGTH), dtype=jnp.int32),
                 position_ids=jnp.zeros((4, SEQ_LENGTH), dtype=jnp.int32),
                 attention_mask=jnp.ones((4, SEQ_LENGTH), dtype=jnp.int32),
                 rngs=rng_generator(llama_config.rng_keys()),
             )
             return DPOTrainState.create(
-                params=params, ref_params=ref_params, tx=optimizer, apply_fn=None
+                params=params, params_ref=params_ref, tx=optimizer, apply_fn=None
             )
 
         train_state_shapes = jax.eval_shape(init_fn, next_rng())
@@ -78,7 +78,7 @@ class InitializationTests(unittest.TestCase):
             create_trainstate_from_params,
             in_shardings=(
                 train_state_partition.params,
-                train_state_partition.ref_params,
+                train_state_partition.params_ref,
             ),  # type: ignore
             out_shardings=train_state_partition,
             donate_argnums=(0,),
